@@ -1,0 +1,19 @@
+# Unix line endings in the working copy on every platform: the test and board
+# scripts run under WSL and Git Bash, and a CR breaks them.
+* text=auto eol=lf
+
+# Stored as they came (CRLF or mixed) and left alone: the MiSTer framework
+# (never edited here) and the Quartus/Windows files.
+sys/** -text
+HP9K715.qpf -text
+HP9K715.srf -text
+clean.bat -text
+
+*.rbf binary
+*.rom binary
+*.eep binary
+*.bin binary
+*.img binary
+*.iso binary
+*.png binary
+release/MiSTer binary
