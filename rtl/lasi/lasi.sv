@@ -97,6 +97,7 @@ module lasi #(
     logic [31:0] amr, errlog, clkreg [4];
     logic        toc_remap;
     logic        irr_clr;                    // an IRR read last cycle
+    logic [31:0] irr_rd;                     // the value it returned: the bits it clears
 
     wire rst_intr = !rst_n || !ioreset[4];
     wire rst_uart_l = !rst_n || !ioreset[6];
@@ -247,8 +248,12 @@ module lasi #(
             if (ext_int && !ext_q && toc_remap) ext_toc <= 1'b1;
             ipr_n = ipr;
             irr_n = irr;
-            // an IRR read clears IRR and the unmasked IPR bits on the next cycle
-            if (irr_clr) begin irr_n = 32'd0; ipr_n = ipr_n & ~imr; end
+            // an IRR read clears, on the next cycle, the bits it returned in IRR and IPR. Only
+            // those: an edge in the read's own cycle reached IRR after the read and stays, with
+            // its interrupt transaction already sent (clearing all of IRR lost it, and HP-UX's
+            // SCSI then hung 30 s until its bus reset: the 53C710's INT landing on the IRR read
+            // of a LAN interrupt, caught by the event recorder on the board, 2026-11-22)
+            if (irr_clr) begin irr_n = irr_n & ~irr_rd; ipr_n = ipr_n & ~irr_rd; end
             if (req && we && in_lasi && page == 4'h0 && addr[11:2] == 10'd2) ipr_n = 32'd0;   // IPR write clears it
             ipr_n = ipr_n | (src & ~src_q);                    // rising edges (win over clears)
             newb  = ipr_n & imr & ~irr_n;
@@ -280,7 +285,7 @@ module lasi #(
             r = 32'd0;
             if (in_lasi) case (page)
                 4'h0: case (addr[11:2])
-                    10'd0: begin r = irr; if (!we) irr_clr <= 1'b1; end
+                    10'd0: begin r = irr; if (!we) begin irr_clr <= 1'b1; irr_rd <= irr; end end
                     10'd1: r = imr;
                     10'd2: r = ipr;
                     10'd3: r = icr_be & 32'h100;

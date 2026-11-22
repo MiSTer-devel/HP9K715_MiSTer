@@ -186,6 +186,18 @@ tb_cdaudio:
 
 .PHONY: tb_cdaudio
 
+# The SCSI targets' data path (rtl/scsi/scsi_targets.sv): random READ/WRITE
+# commands on both disks against a model, block requests served after a
+# random delay, CD audio frames in between (tb/tb_scsi.cpp)
+TB_SCSI_ARGS ?= 1 400
+tb_scsi:
+	$(V) --cc --exe --build -j 0 -Wno-fatal -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL -O3 --Mdir obj_dir_tb/scsi \
+		-Wno-WIDTHEXPAND -Wno-WIDTHTRUNC --top-module scsi_targets -o tb_scsi \
+		$(RTL)/scsi/cd_audio.sv $(RTL)/scsi/scsi_targets.sv tb/tb_scsi.cpp
+	./obj_dir_tb/scsi/tb_scsi $(TB_SCSI_ARGS)
+
+.PHONY: tb_scsi
+
 # the 82596 LAN: start-up, self-test, init, loopback, the bridge's RX/TX slots
 # through a Linux-style RFD/RBD ring and TBD chains (tb/tb_i82596.cpp)
 tb_i82596:

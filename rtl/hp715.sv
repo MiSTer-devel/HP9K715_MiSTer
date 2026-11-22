@@ -528,7 +528,8 @@ module hp715 #(
             ev_line_q <= {mem_we, mem_addr};
             if ({mem_we, mem_addr} != ev_line_q) begin set[4] = 1; e[4] = {mem_we ? 8'd7 : 8'd6, 7'd0, mem_ifill & ~mem_we, mem_addr, 64'd0}; end
         end
-        if (io_req && io_ack && !io_ifetch && (io_addr[31:12] == 20'hF0106 || io_addr[31:28] != 4'hF ||
+        // (LASI's interrupt registers too, F0100000: the IRR reads of the SCSI hang, 2026-11-22)
+        if (io_req && io_ack && !io_ifetch && (io_addr[31:12] == 20'hF0106 || io_addr[31:12] == 20'hF0100 || io_addr[31:28] != 4'hF ||
                                                io_addr[31:25] == 7'h7C)) begin
             set[5] = 1; e[5] = {io_we ? 8'd9 : 8'd8, io_be, io_addr, io_we ? io_wdata : io_rdata};
         end

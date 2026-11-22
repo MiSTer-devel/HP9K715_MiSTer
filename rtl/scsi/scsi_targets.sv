@@ -75,20 +75,26 @@ module scsi_targets #(
                            P_MOUT = 3'b110, P_MIN = 3'b111;
 
     // ----------------------------------------------------- sector buffer
-    // 2 KB = 1024 halfwords; hps_io's halfword w = {byte 2w+1, byte 2w}
-    (* ramstyle = "M10K, no_rw_check" *) logic [1:0][7:0] buf_mem [0:1023];
-    logic [10:0] b_addr;        // byte address, engine side
+    // two banks of 4 KB (2048 halfwords each); hps_io's halfword w = {byte
+    // 2w+1, byte 2w}. A request to the image is at most one bank (8 blocks).
+    // The engine works on bank e_bank while hps_io fills or empties h_bank:
+    // a READ fetches its next chunk into the other bank while the current one
+    // goes out on the bus, a WRITE takes its next chunk off the bus while the
+    // previous one is stored (system.md 5; the SGI Indy core's scheme)
+    (* ramstyle = "M10K, no_rw_check" *) logic [1:0][7:0] buf_mem [0:4095];
+    logic [11:0] b_addr;        // byte address in e_bank, engine side
+    logic        e_bank, h_bank;
     logic        b_we;
     logic [7:0]  b_wdata, b_q;
     logic [15:0] h_q;
     logic        aud_xfer;              // the transfer is the CD player's frame
     always @(posedge clk) begin           // port A: hps_io
-        if (sd_buff_wr && |sd_ack && !aud_xfer) buf_mem[sd_buff_addr[9:0]] <= sd_buff_dout;
-        h_q <= buf_mem[sd_buff_addr[9:0]];
+        if (sd_buff_wr && |sd_ack && !aud_xfer) buf_mem[{h_bank, sd_buff_addr[10:0]}] <= sd_buff_dout;
+        h_q <= buf_mem[{h_bank, sd_buff_addr[10:0]}];
     end
     always @(posedge clk) begin           // port B: the engine, one byte
-        if (b_we) buf_mem[b_addr[10:1]][b_addr[0]] <= b_wdata;
-        b_q <= buf_mem[b_addr[10:1]][b_addr[0]];
+        if (b_we) buf_mem[{e_bank, b_addr[11:1]}][b_addr[0]] <= b_wdata;
+        b_q <= buf_mem[{e_bank, b_addr[11:1]}][b_addr[0]];
     end
     assign sd_buff_din[0] = h_q;
     assign sd_buff_din[1] = h_q;
@@ -127,8 +133,10 @@ module scsi_targets #(
     logic [9:0]  d_idx;                  // byte index into the synthesised response (at most 804)
     logic [31:0] x_lba;                  // next block of a READ/WRITE
     logic [18:0] x_blocks;               // 512-byte blocks left (at most 65535 CD blocks x 4)
-    logic [11:0] chunk;                  // bytes left in the buffer chunk
+    logic [12:0] chunk;                  // bytes left in the buffer chunk (at most 4096)
     logic        pending;                // waiting for the buffer byte
+    logic        pf_v, pf_wait;          // READ: the next chunk is requested into ~e_bank / not yet in
+    logic [3:0]  pf_n;                   // its blocks (1..8)
     logic        hold_seen;
 
     // ------------------------------------------------------------ CD audio
@@ -378,6 +386,15 @@ module scsi_targets #(
 
     assign activity = st != T_FREE;
 
+    // a frame for the CD player, between the engine's own transfers
+    wire aud_go = fr_req && !fr_go && !sd_busy && img_present[2] &&
+                  st != T_FETCH && st != T_DOUT && st != T_STORE && st != T_TOC;
+    // a READ asks for its next chunk once the other bank is free: at the start
+    // (T_FETCH) and while the current chunk goes out (T_DIN)
+    wire rd_go = !din_synth && (st == T_FETCH || st == T_DIN) && !pf_v && x_blocks != 19'd0 &&
+                 !sd_busy && !aud_go;
+    wire [3:0] x_n = (x_blocks >= 19'd8) ? 4'd8 : x_blocks[3:0];     // the next chunk's blocks
+
     task automatic go_status(input logic [7:0] s);
         status <= s; st <= T_STAT; req <= 1'b1; phase <= P_STAT; tdata <= s;
     endtask
@@ -390,7 +407,7 @@ module scsi_targets #(
         if (rst || brst) begin
             st <= T_FREE; bsy <= 1'b0; req <= 1'b0; sd_rd <= 3'd0; sd_wr <= 3'd0; sd_busy <= 1'b0;
             for (int d = 0; d < 3; d++) begin skey[d] <= 4'd0; sasc[d] <= 8'd0; end
-            pending <= 1'b0; aud_xfer <= 1'b0;
+            pending <= 1'b0; aud_xfer <= 1'b0; pf_v <= 1'b0; pf_wait <= 1'b0;
             if (rst) begin toc_ok <= 1'b0; toc_n <= 8'd0; vol0 <= 8'hFF; vol1 <= 8'hFF; a_stop <= 1'b1; end
         end else begin
             // block device handshake: drop rd/wr when ack rises, done when it falls
@@ -398,15 +415,21 @@ module scsi_targets #(
             if (sd_busy && sd_was_ack && !(|sd_ack) && !(|sd_rd) && !(|sd_wr)) begin
                 sd_busy <= 1'b0;
                 if (aud_xfer) begin aud_xfer <= 1'b0; fr_done <= 1'b1; end
+                else pf_wait <= 1'b0;                    // a READ's chunk is in (only reads set it)
             end
             // a new disc: its table is read again at the next command that needs it
             if (cd_change) begin toc_ok <= 1'b0; toc_n <= 8'd0; a_stop <= 1'b1; end
 
-            // a frame for the CD player, between the engine's own transfers
-            if (fr_req && !fr_go && !sd_busy && img_present[2] &&
-                st != T_FETCH && st != T_DOUT && st != T_STORE && st != T_TOC) begin
+            if (aud_go) begin
                 s_lba <= fr_lba; s_blk_cnt <= 6'd4; sd_rd[2] <= 1'b1; sd_busy <= 1'b1; sd_dev <= 2'd2;
                 aud_xfer <= 1'b1; fr_go <= 1'b1;
+            end
+            // a READ's next chunk into the bank the engine is not reading
+            if (rd_go) begin
+                s_lba <= x_lba; s_blk_cnt <= {2'd0, x_n - 4'd1}; sd_rd[dev] <= 1'b1; sd_busy <= 1'b1;
+                sd_dev <= dev; h_bank <= ~e_bank;
+                x_lba <= x_lba + {28'd0, x_n}; x_blocks <= x_blocks - {15'd0, x_n};
+                pf_v <= 1'b1; pf_wait <= 1'b1; pf_n <= x_n;
             end
 
             case (st)
@@ -582,7 +605,7 @@ module scsi_targets #(
                                 d_left <= (op == 8'h15) ? {8'd0, cdb[4]} : {cdb[7], cdb[8]};
                                 x_blocks <= 19'd0;
                                 if (((op == 8'h15) ? cdb[4] : cdb[8]) == 8'd0 && (op == 8'h15 || cdb[7] == 8'd0)) go_status(8'h00);
-                                else begin st <= T_DOUT; phase <= P_DOUT; req <= 1'b1; chunk <= 12'd0; end
+                                else begin st <= T_DOUT; phase <= P_DOUT; req <= 1'b1; chunk <= 13'd0; end
                             end else if (is_cd) begin
                                 skey[dev] <= 4'h7; sasc[dev] <= 8'h27; go_status(8'h02);   // write protected
                             end else if ((lba + cnt) > blocks) begin
@@ -590,8 +613,8 @@ module scsi_targets #(
                             end else if (cnt == 0) go_status(8'h00);
                             else begin
                                 x_lba <= lba; x_blocks <= 19'(cnt); d_left <= 16'd0;
-                                chunk <= (cnt >= 4) ? 12'd2048 : {cnt[2:0], 9'd0};
-                                b_addr <= 11'd0;
+                                chunk <= (cnt >= 8) ? 13'd4096 : {cnt[3:0], 9'd0};
+                                b_addr <= 12'd0;
                                 st <= T_DOUT; phase <= P_DOUT; req <= 1'b1;
                             end
                         end
@@ -599,30 +622,26 @@ module scsi_targets #(
                     endcase
                 end
 
-                // read the next chunk (up to 2 KB) from the image
-                T_FETCH: if (!sd_busy) begin
-                    if (x_blocks == 0) go_status(8'h00);
-                    else begin
-                        logic [2:0] n;
-                        n = (x_blocks >= 19'd4) ? 3'd4 : x_blocks[2:0];
-                        s_lba <= x_lba; s_blk_cnt <= {3'd0, n - 3'd1}; sd_rd[dev] <= 1'b1; sd_busy <= 1'b1;
-                        sd_dev <= dev;
-                        x_lba <= x_lba + {29'd0, n}; x_blocks <= x_blocks - {16'd0, n};
-                        chunk <= {n, 9'd0};
-                        b_addr <= 11'd0; pending <= 1'b1;
+                // the next chunk (up to 4 KB, asked for by rd_go): once it is in,
+                // the engine reads that bank; with no more blocks, the status
+                T_FETCH: if (pf_v) begin
+                    if (!pf_wait) begin
+                        e_bank <= ~e_bank; chunk <= {pf_n, 9'd0}; pf_v <= 1'b0;
+                        b_addr <= 12'd0; pending <= 1'b1;
                         st <= T_DIN;
                     end
-                end
+                end else if (x_blocks == 19'd0 && !sd_busy) go_status(8'h00);
 
-                // DATA IN, from the synthesised response or the buffer
+                // DATA IN, from the synthesised response or the buffer (whose
+                // bank hps_io does not touch: a READ's next chunk may be filling)
                 T_DIN: begin
                     if (ack && req) begin
                         req <= 1'b0; pending <= 1'b1;
                         if (din_synth) begin d_idx <= d_idx + 10'd1; d_left <= d_left - 16'd1; end
-                        else begin b_addr <= b_addr + 11'd1; chunk <= chunk - 12'd1; end
-                    end else if (!req && !sd_busy) begin
+                        else begin b_addr <= b_addr + 12'd1; chunk <= chunk - 13'd1; end
+                    end else if (!req && (!sd_busy || !din_synth)) begin
                         if (din_synth && d_left == 16'd0) go_status(8'h00);
-                        else if (!din_synth && chunk == 12'd0) st <= T_FETCH;
+                        else if (!din_synth && chunk == 13'd0) st <= T_FETCH;
                         else if (pending) pending <= 1'b0;           // b_q / syn valid the cycle after
                         else begin req <= 1'b1; tdata <= din_synth ? syn : b_q; end
                     end
@@ -649,42 +668,43 @@ module scsi_targets #(
                             if (is_cd && ms_pg == 6'h0E && {6'd0, ms_i} == po + 16'd11) vol1 <= idata;
                             if (ms_i != 10'h3FF) ms_i <= ms_i + 10'd1;      // the pages lie below 275
                         end
-                        else begin b_we <= 1'b1; b_wdata <= idata; chunk <= chunk - 12'd1; end
+                        else begin b_we <= 1'b1; b_wdata <= idata; chunk <= chunk - 13'd1; end
                     end else if (!req) begin
-                        if (b_we) b_addr <= b_addr + 11'd1;
+                        if (b_we) b_addr <= b_addr + 12'd1;
                         if (x_blocks == 0 && d_left == 0 && chunk == 0 && !b_we) go_status(8'h00);
                         else if (x_blocks == 0 && d_left != 0) req <= 1'b1;
-                        else if (chunk == 12'd0 && !b_we) begin
-                            // once a CD frame in flight is done (s_lba is shared)
+                        else if (chunk == 13'd0 && !b_we) begin
+                            // once the previous chunk is stored (or a CD frame in flight
+                            // is done: s_lba is shared), store this one from its bank and
+                            // take the next one into the other
                             if (!sd_busy) begin
-                                logic [2:0] n;
-                                n = (x_blocks >= 19'd4) ? 3'd4 : x_blocks[2:0];
-                                s_lba <= x_lba; s_blk_cnt <= {3'd0, n - 3'd1}; sd_wr[dev] <= 1'b1;
-                                sd_busy <= 1'b1; sd_dev <= dev;
-                                x_lba <= x_lba + {29'd0, n}; x_blocks <= x_blocks - {16'd0, n};
-                                st <= T_STORE;
+                                logic [18:0] left;
+                                left = x_blocks - {15'd0, x_n};
+                                s_lba <= x_lba; s_blk_cnt <= {2'd0, x_n - 4'd1}; sd_wr[dev] <= 1'b1;
+                                sd_busy <= 1'b1; sd_dev <= dev; h_bank <= e_bank;
+                                x_lba <= x_lba + {28'd0, x_n}; x_blocks <= left;
+                                if (left == 19'd0) st <= T_STORE;
+                                else begin
+                                    e_bank <= ~e_bank; b_addr <= 12'd0; req <= 1'b1;
+                                    chunk <= (left >= 19'd8) ? 13'd4096 : {left[3:0], 9'd0};
+                                end
                             end
                         end else if (!b_we) req <= 1'b1;
                     end
                 end
-                T_STORE: if (!sd_busy && !(|sd_wr)) begin
-                    if (x_blocks == 0) go_status(8'h00);
-                    else begin
-                        st <= T_DOUT; b_addr <= 11'd0; req <= 1'b1;
-                        chunk <= (x_blocks >= 4) ? 12'd2048 : {x_blocks[2:0], 9'd0};
-                    end
-                end
+                // the last chunk stored: the status
+                T_STORE: if (!sd_busy && !(|sd_wr)) go_status(8'h00);
 
                 // the track table: 2 blocks from the window into the buffer, then
                 // header bytes 0 (first track) and 1 (n) and n + 1 entries of 8
                 // bytes from byte 8 into toc; then the command runs again
                 T_TOC: if (!sd_busy) begin
                     s_lba <= 32'hC000_0000; s_blk_cnt <= 6'd1; sd_rd[2] <= 1'b1;
-                    sd_busy <= 1'b1; sd_dev <= 2'd2; st <= T_TOCW;
+                    sd_busy <= 1'b1; sd_dev <= 2'd2; st <= T_TOCW; h_bank <= 1'b0; e_bank <= 1'b0;
                 end
                 T_TOCW: if (!sd_busy) begin cp_b <= 11'd0; cp_s <= 2'd0; st <= T_TOCCP; end
                 T_TOCCP: case (cp_s)
-                    2'd0: begin b_addr <= cp_b; cp_s <= 2'd1; end
+                    2'd0: begin b_addr <= {1'b0, cp_b}; cp_s <= 2'd1; end
                     2'd1: cp_s <= 2'd2;
                     2'd2: begin
                         logic last_e;
